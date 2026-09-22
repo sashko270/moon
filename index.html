@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>AR Луна</title>
+<style>
+  :root { --glass: rgba(8,12,20,.72); --line: rgba(255,255,255,.55); }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; width:100%; height:100%; overflow:hidden; background:#000; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif; color:#fff; }
+  #video { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }
+  #ar { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; }
+  #ui { position:fixed; inset:0; pointer-events:none; }
+  button { pointer-events:auto; border:0; color:#fff; background:rgba(15,18,25,.76); border:1px solid rgba(255,255,255,.22); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); }
+  #start { position:fixed; inset:0; display:grid; place-items:center; background:rgba(0,0,0,.88); z-index:20; padding:28px; text-align:center; }
+  #startCard { max-width:430px; padding:24px; border-radius:24px; background:rgba(18,20,26,.94); border:1px solid rgba(255,255,255,.15); }
+  #start h1 { margin:0 0 10px; font-size:28px; }
+  #start p { margin:0 0 18px; color:#cbd0da; line-height:1.45; }
+  #startBtn { padding:14px 20px; border-radius:16px; font-size:17px; font-weight:700; }
+  #status { position:fixed; top:max(14px,env(safe-area-inset-top)); left:50%; transform:translateX(-50%); z-index:5; padding:8px 12px; border-radius:14px; background:rgba(0,0,0,.52); backdrop-filter:blur(8px); font-size:12px; color:#e9edf5; opacity:.9; }
+  #trajectoryControls { position:fixed; left:12px; right:12px; bottom:max(14px,env(safe-area-inset-bottom)); display:flex; gap:10px; justify-content:center; }
+  .trajBtn { min-width:132px; padding:11px 14px; border-radius:15px; font-size:14px; font-weight:650; }
+  .trajBtn.active { background:rgba(245,245,255,.92); color:#090b10; border-color:#fff; }
+  #moonInfo { position:absolute; min-width:180px; max-width:245px; transform:translate(-50%,-100%); margin-top:-18px; display:none; padding:11px 13px; border-radius:13px; background:rgba(9,12,18,.82); border:1px solid rgba(255,255,255,.35); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); font-size:13px; line-height:1.35; }
+  #moonInfo b { display:block; font-size:14px; margin-bottom:3px; }
+  #error { position:fixed; left:20px; right:20px; bottom:90px; z-index:10; display:none; padding:14px; border-radius:16px; background:rgba(20,22,28,.92); border:1px solid rgba(255,255,255,.2); text-align:center; line-height:1.4; }
+  #retry { margin-top:10px; padding:10px 15px; border-radius:12px; font-weight:700; }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<canvas id="ar"></canvas>
+
+<div id="ui">
+  <div id="status">Инициализация…</div>
+  <div id="moonInfo"></div>
+  <div id="trajectoryControls">
+    <button class="trajBtn" id="btn12">12 часов</button>
+    <button class="trajBtn" id="btnCycle">Лунный цикл</button>
+  </div>
+</div>
+
+<div id="error">
+  <div id="errorText"></div>
+  <button id="retry">Повторить попытку</button>
+</div>
+
+<div id="start">
+  <div id="startCard">
+    <h1>AR Луна</h1>
+    <p>Разрешите камеру, геолокацию и ориентацию устройства. После этого приложение сразу перейдёт в AR-режим.</p>
+    <button id="startBtn">Запустить AR</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("ar");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const startEl = document.getElementById("start");
+  const startBtn = document.getElementById("startBtn");
+  const errorEl = document.getElementById("error");
+  const errorText = document.getElementById("errorText");
+  const retryBtn = document.getElementById("retry");
+  const btn12 = document.getElementById("btn12");
+  const btnCycle = document.getElementById("btnCycle");
+  const infoEl = document.getElementById("moonInfo");
+
+  let W=innerWidth, H=innerHeight, dpr=Math.min(devicePixelRatio||1,2);
+  let locationData=null, orientation=null, started=false;
+  let trajectoryMode=null; // null | "12h" | "cycle"
+  let selectedPoint=null;
+  let lastDraw=0;
+
+  const TAU=Math.PI*2, DEG=Math.PI/180, RAD=180/Math.PI;
+
+  function resize(){
+    W=innerWidth; H=innerHeight; dpr=Math.min(devicePixelRatio||1,2);
+    canvas.width=Math.round(W*dpr); canvas.height=Math.round(H*dpr);
+    canvas.style.width=W+"px"; canvas.style.height=H+"px";
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  addEventListener("resize", resize); resize();
+
+  function setStatus(s){ statusEl.textContent=s; }
+
+  function showError(s){
+    errorText.textContent=s; errorEl.style.display="block";
+  }
+  function hideError(){ errorEl.style.display="none"; }
+
+  function wrap360(x){ x%=360; return x<0?x+360:x; }
+  function wrap180(x){ x=wrap360(x); return x>180?x-360:x; }
+  function clamp(x,a,b){ return Math.max(a,Math.min(b,x)); }
+
+  // Julian date / time
+  function julianDate(date){ return date.getTime()/86400000 + 2440587.5; }
+
+  // Approximate geocentric lunar position based on a truncated Meeus-style
+  // periodic model. This is deliberately self-contained: no external API/library.
+  function moonGeocentric(date){
+    const d=julianDate(date)-2451543.5;
+    const N=wrap360(125.1228-0.0529538083*d);
+    const i=5.1454;
+    const w=wrap360(318.0634+0.1643573223*d);
+    const a=60.2666;
+    const e=0.054900;
+    const M=wrap360(115.3654+13.0649929509*d);
+
+    const E=M + RAD*e*Math.sin(M*DEG)*(1+e*Math.cos(M*DEG));
+    const xv=a*(Math.cos(E*DEG)-e);
+    const yv=a*(Math.sqrt(1-e*e)*Math.sin(E*DEG));
+    const v=Math.atan2(yv,xv)*RAD;
+    const r=Math.hypot(xv,yv);
+    const vw=(v+w)*DEG, NN=N*DEG, ii=i*DEG;
+    const xh=r*(Math.cos(NN)*Math.cos(vw)-Math.sin(NN)*Math.sin(vw)*Math.cos(ii));
+    const yh=r*(Math.sin(NN)*Math.cos(vw)+Math.cos(NN)*Math.sin(vw)*Math.cos(ii));
+    const zh=r*(Math.sin(vw)*Math.sin(ii));
+
+    const lon=wrap360(Math.atan2(yh,xh)*RAD);
+    const lat=Math.atan2(zh,Math.hypot(xh,yh))*RAD;
+
+    // Solar position for approximate lunar elongation / illuminated phase.
+    const sun=sunEcliptic(date);
+    let elong=wrap360(lon-sun.lon);
+    const phaseAngle=wrap180(elong); // signed elongation
+    const illumination=(1-Math.cos(Math.abs(phaseAngle)*DEG))/2;
+    return {lon,lat,distanceEarthKm:r*6378.14,phaseAngle,illumination};
+  }
+
+  function sunEcliptic(date){
+    const d=julianDate(date)-2451543.5;
+    const w=wrap360(282.9404+4.70935E-5*d);
+    const e=0.016709-1.151E-9*d;
+    const M=wrap360(356.0470+0.9856002585*d);
+    const E=M+RAD*e*Math.sin(M*DEG)*(1+e*Math.cos(M*DEG));
+    const xv=Math.cos(E*DEG)-e;
+    const yv=Math.sqrt(1-e*e)*Math.sin(E*DEG);
+    const v=Math.atan2(yv,xv)*RAD;
+    const r=Math.hypot(xv,yv);
+    return {lon:wrap360(v+w), r};
+  }
+
+  // Obliquity and ecliptic -> equatorial.
+  function eclToEqu(lon,lat,date){
+    const T=(julianDate(date)-2451545)/36525;
+    const eps=(23.439291-0.0130042*T)*DEG;
+    const L=lon*DEG, B=lat*DEG;
+    const x=Math.cos(B)*Math.cos(L);
+    const y=Math.cos(B)*Math.sin(L)*Math.cos(eps)-Math.sin(B)*Math.sin(eps);
+    const z=Math.cos(B)*Math.sin(L)*Math.sin(eps)+Math.sin(B)*Math.cos(eps);
+    return {ra:wrap360(Math.atan2(y,x)*RAD), dec:Math.asin(z)*RAD};
+  }
+
+  function gmst(date){
+    const jd=julianDate(date);
+    const T=(jd-2451545.0)/36525;
+    return wrap360(280.46061837 + 360.98564736629*(jd-2451545) + 0.000387933*T*T - T*T*T/38710000);
+  }
+
+  // Observer-specific topocentric altitude/azimuth.
+  function moonAltAz(date, latDeg, lonDeg, heightM=0){
+    const m=moonGeocentric(date);
+    const eq=eclToEqu(m.lon,m.lat,date);
+    const lat=latDeg*DEG;
+    const lst=wrap360(gmst(date)+lonDeg);
+    const H=wrap180(lst-eq.ra)*DEG;
+    const dec=eq.dec*DEG;
+
+    const sinAlt=Math.sin(lat)*Math.sin(dec)+Math.cos(lat)*Math.cos(dec)*Math.cos(H);
+    let alt=Math.asin(clamp(sinAlt,-1,1));
+    let az=Math.atan2(Math.sin(H), Math.cos(H)*Math.sin(lat)-Math.tan(dec)*Math.cos(lat))*RAD+180;
+
+    // First-order topocentric parallax.
+    const pi=Math.asin(6378.14/m.distanceEarthKm);
+    const u=Math.atan(0.99664719*Math.tan(lat));
+    const rhoSin=0.99664719*Math.sin(u)+(heightM/6378137)*Math.sin(lat);
+    const rhoCos=Math.cos(u)+(heightM/6378137)*Math.cos(lat);
+    const sinPi=Math.sin(pi);
+    const topH=H;
+    const deltaAlpha=Math.atan2(-rhoCos*sinPi*Math.sin(topH),
+      Math.cos(dec)-rhoCos*sinPi*Math.cos(topH));
+    const raTop=(eq.ra*DEG+deltaAlpha);
+    const decTop=Math.atan2(
+      (Math.sin(dec)-rhoSin*sinPi),
+      (Math.cos(dec)-rhoCos*sinPi*Math.cos(topH))
+    );
+    const Htop=wrap180(lst-raTop*RAD)*DEG;
+    const sinAltTop=Math.sin(lat)*Math.sin(decTop)+Math.cos(lat)*Math.cos(decTop)*Math.cos(Htop);
+    alt=Math.asin(clamp(sinAltTop,-1,1));
+    az=Math.atan2(Math.sin(Htop),Math.cos(Htop)*Math.sin(lat)-Math.tan(decTop)*Math.cos(lat))*RAD+180;
+
+    // Simple refraction correction above/below -1 degree.
+    let altDeg=alt*RAD;
+    if(altDeg>-1 && altDeg<90){
+      altDeg += (1.02 / Math.tan((altDeg+10.3/(altDeg+5.11))*DEG))/60;
+    }
+    return {
+      az:wrap360(az),
+      alt:altDeg,
+      ra:wrap360(raTop*RAD),
+      dec:decTop*RAD,
+      phaseAngle:m.phaseAngle,
+      illumination:m.illumination,
+      distance:m.distanceEarthKm
+    };
+  }
+
+  // Convert the phone orientation event to a heading (clockwise from true-ish north)
+  // and pitch. iOS exposes webkitCompassHeading on Safari. We use that when available.
+  function onOrientation(e){
+    let heading = Number.isFinite(e.webkitCompassHeading) ? e.webkitCompassHeading : null;
+    if(heading==null && Number.isFinite(e.alpha)) heading=wrap360(360-e.alpha);
+    if(heading==null) return;
+
+    // beta: front/back tilt. For a phone held upright toward the sky, this
+    // approximation gives an elevation of the camera optical axis.
+    let alt = 90 - (Number.isFinite(e.beta)?e.beta:90);
+    // gamma changes the apparent orientation when held rotated; compensate
+    // with screen orientation where possible.
+    const angle=(screen.orientation && Number.isFinite(screen.orientation.angle))
+      ? screen.orientation.angle : (window.orientation||0);
+    if(Math.abs(angle)===90){
+      // For landscape, use gamma as the main vertical tilt estimate.
+      alt = 90 - (angle>0 ? -e.gamma : e.gamma);
+      heading = wrap360(heading + (angle>0 ? -90 : 90));
+    }
+    orientation={heading:wrap360(heading),alt:clamp(alt,-90,90),alpha:e.alpha,beta:e.beta,gamma:e.gamma,absolute:e.absolute};
+  }
+
+  function requestOrientation(){
+    return new Promise(async(resolve,reject)=>{
+      try{
+        if(typeof DeviceOrientationEvent!=="undefined" &&
+           typeof DeviceOrientationEvent.requestPermission==="function"){
+          const p=await DeviceOrientationEvent.requestPermission(true);
+          if(p!=="granted") return reject(new Error("Доступ к ориентации устройства отклонён."));
+        }
+        addEventListener("deviceorientation",onOrientation,true);
+        addEventListener("deviceorientationabsolute",onOrientation,true);
+        resolve();
+      }catch(err){ reject(err); }
+    });
+  }
+
+  async function requestLocation(){
+    if(!navigator.geolocation) throw new Error("Геолокация недоступна в этом браузере.");
+    return new Promise((resolve,reject)=>{
+      navigator.geolocation.watchPosition(pos=>{
+        locationData={
+          lat:pos.coords.latitude,
+          lon:pos.coords.longitude,
+          alt:pos.coords.altitude||0,
+          accuracy:pos.coords.accuracy
+        };
+        resolve(locationData);
+      },err=>{
+        reject(new Error("Не удалось получить геолокацию: "+err.message));
+      },{
+        enableHighAccuracy:true, maximumAge:5000, timeout:15000
+      });
+    });
+  }
+
+  async function requestCamera(){
+    if(!navigator.mediaDevices?.getUserMedia) throw new Error("Камера недоступна. Откройте страницу через HTTPS.");
+    const stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:"environment"}, width:{ideal:1920}, height:{ideal:1080}},
+      audio:false
+    });
+    video.srcObject=stream;
+    await video.play();
+  }
+
+  async function start(){
+    hideError();
+    startBtn.disabled=true;
+    try{
+      if(!window.isSecureContext) throw new Error("Для камеры, геолокации и датчиков нужна HTTPS-страница. GitHub Pages подходит.");
+      await requestOrientation();
+      await requestLocation();
+      await requestCamera();
+      started=true;
+      startEl.style.display="none";
+      setStatus("AR готов. Наведите iPhone на небо.");
+      requestAnimationFrame(loop);
+    }catch(e){
+      startBtn.disabled=false;
+      showError(e.message||"Не удалось запустить AR.");
+    }
+  }
+
+  startBtn.addEventListener("click",start);
+  retryBtn.addEventListener("click",()=>{ errorEl.style.display="none"; start(); });
+
+  function trajectoryDates(mode, now){
+    const arr=[];
+    if(mode==="12h"){
+      for(let minutes=-720;minutes<=720;minutes+=30) arr.push(new Date(now.getTime()+minutes*60000));
+    } else {
+      // Synodic month ≈ 29.53059 days; 12-hour spacing.
+      const totalHours=29.53059*24;
+      for(let h=0;h<=totalHours;h+=12) arr.push(new Date(now.getTime()+h*3600000));
+    }
+    return arr;
+  }
+
+  function phaseName(illum, signedElong){
+    if(illum<0.03) return "Новолуние";
+    if(illum>0.97) return "Полнолуние";
+    if(signedElong>0 && signedElong<180) return "Растущая";
+    return "Убывающая";
+  }
+
+  function formatDateTime(d){
+    return new Intl.DateTimeFormat("ru-RU",{dateStyle:"medium",timeStyle:"short"}).format(d);
+  }
+
+  function angularDiff(a,b){ return wrap180(a-b); }
+
+  // Equirectangular AR projection. It deliberately uses the live device heading
+  // and elevation, so the trajectory is anchored to sky directions, not pixels.
+  function project(az,alt){
+    if(!orientation) return null;
+    const dx=angularDiff(az,orientation.heading);
+    const dy=alt-orientation.alt;
+    const fovH=72; // reasonable default iPhone rear-camera visual field
+    const fovV=fovH*(H/W);
+    if(Math.abs(dx)>fovH*0.72 || Math.abs(dy)>fovV*0.72) return null;
+    return {
+      x:W/2 + (dx/fovH)*W,
+      y:H/2 - (dy/fovV)*H
+    };
+  }
+
+  function drawArrow(target){
+    if(!orientation || !target) return;
+    const dx=angularDiff(target.az,orientation.heading);
+    const dy=target.alt-orientation.alt;
+    const fovH=72, fovV=fovH*(H/W);
+    const inside=Math.abs(dx)<fovH/2 && Math.abs(dy)<fovV/2;
+    if(inside) return;
+
+    let vx=dx/(fovH/2), vy=-dy/(fovV/2);
+    const mag=Math.hypot(vx,vy)||1;
+    vx/=mag; vy/=mag;
+    const cx=W/2+vx*(Math.min(W,H)*0.34);
+    const cy=H/2+vy*(Math.min(W,H)*0.34);
+    const size=clamp(22+Math.min(70,Math.hypot(dx,dy)*0.45),22,92);
+    const ang=Math.atan2(vy,vx);
+
+    ctx.save();
+    ctx.translate(cx,cy); ctx.rotate(ang);
+    ctx.fillStyle="rgba(255,255,255,.94)";
+    ctx.strokeStyle="rgba(0,0,0,.5)"; ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(size,0);
+    ctx.lineTo(-size*.45,-size*.52);
+    ctx.lineTo(-size*.18,0);
+    ctx.lineTo(-size*.45,size*.52);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawMoonSprite(x,y,r,illum,phaseAngle){
+    const rr=Math.max(28,Math.min(95,r));
+    const img=ctx.createRadialGradient(x-rr*.28,y-rr*.28,rr*.08,x,y,rr);
+    img.addColorStop(0,"#f5f5ee"); img.addColorStop(.72,"#b7b8b0"); img.addColorStop(1,"#6e706b");
+    ctx.save();
+    ctx.beginPath(); ctx.arc(x,y,rr,0,TAU); ctx.clip();
+    ctx.fillStyle=img; ctx.fillRect(x-rr,y-rr,2*rr,2*rr);
+
+    // Procedural lunar relief texture.
+    const seed=Math.floor((Math.abs(Math.sin(phaseAngle*12.345))*1e6));
+    for(let i=0;i<55;i++){
+      const a=(seed*(i+3)*12.9898)%TAU;
+      const rad=(seed*(i+7)*78.233%100)/100*rr*.88;
+      const cx=x+Math.cos(a)*rad, cy=y+Math.sin(a)*rad;
+      const cr=rr*(.012+(i%7)/420);
+      ctx.fillStyle=i%2?"rgba(50,52,50,.16)":"rgba(255,255,255,.10)";
+      ctx.beginPath(); ctx.arc(cx,cy,cr,0,TAU); ctx.fill();
+    }
+
+    // Phase mask: terminator shape approximated as an illuminated half-sphere.
+    const frac=illum;
+    const waxing=phaseAngle>0;
+    ctx.globalCompositeOperation="destination-in";
+    ctx.fillStyle="#fff";
+    ctx.beginPath();
+    ctx.arc(x,y,rr,0,TAU); ctx.fill();
+    ctx.globalCompositeOperation="source-over";
+    const limb=Math.abs(2*frac-1)*rr;
+    ctx.fillStyle="rgba(0,0,0,.94)";
+    ctx.beginPath();
+    if(waxing){
+      ctx.moveTo(x,y-rr); ctx.arc(x,y,rr,-Math.PI/2,Math.PI/2,false);
+      ctx.bezierCurveTo(x+limb,y+rr*.65,x+limb,y-rr*.65,x,y-rr);
+    }else{
+      ctx.moveTo(x,y-rr); ctx.arc(x,y,rr,Math.PI/2,3*Math.PI/2,false);
+      ctx.bezierCurveTo(x-limb,y-rr*.65,x-limb,y+rr*.65,x,y-rr);
+    }
+    ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle="rgba(255,255,255,.9)"; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(x,y,rr,0,TAU); ctx.stroke();
+  }
+
+  function drawFrame(x,y,r){
+    const s=r+18, c=12;
+    ctx.strokeStyle="rgba(255,255,255,.95)"; ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(x-s+c,y-s);ctx.lineTo(x-s,y-s);ctx.lineTo(x-s,y-s+c);
+    ctx.moveTo(x+s-c,y-s);ctx.lineTo(x+s,y-s);ctx.lineTo(x+s,y-s+c);
+    ctx.moveTo(x-s,y+s-c);ctx.lineTo(x-s,y+s);ctx.lineTo(x-s+c,y+s);
+    ctx.moveTo(x+s-c,y+s);ctx.lineTo(x+s,y+s);ctx.lineTo(x+s,y+s-c);
+    ctx.stroke();
+  }
+
+  function drawInfo(x,y,target){
+    const phase=phaseName(target.illumination,target.phaseAngle);
+    const text=`${phase} · ${Math.round(target.illumination*100)}%`;
+    ctx.font="600 13px -apple-system,BlinkMacSystemFont,sans-serif";
+    const pad=9, tw=ctx.measureText(text).width;
+    const bx=x+52, by=y-42, bw=tw+pad*2, bh=32;
+    ctx.fillStyle="rgba(7,10,16,.78)";
+    ctx.strokeStyle="rgba(255,255,255,.35)";
+    ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,9);ctx.fill();ctx.stroke();
+    ctx.fillStyle="#fff";ctx.fillText(text,bx+pad,by+21);
+  }
+
+  function drawTrajectory(now){
+    if(!trajectoryMode || !locationData || !orientation) return null;
+    const dates=trajectoryDates(trajectoryMode,now);
+    const pts=dates.map(d=>{
+      const t=moonAltAz(d,locationData.lat,locationData.lon,locationData.alt);
+      const p=project(t.az,t.alt);
+      return {date:d,t,p};
+    });
+
+    ctx.save();
+    ctx.lineWidth=2;
+    ctx.strokeStyle="rgba(255,255,255,.72)";
+    ctx.beginPath();
+    let drawing=false;
+    for(const q of pts){
+      if(q.p){
+        if(!drawing){ctx.moveTo(q.p.x,q.p.y);drawing=true;}
+        else ctx.lineTo(q.p.x,q.p.y);
+      } else drawing=false;
+    }
+    ctx.stroke();
+
+    for(const q of pts){
+      if(!q.p) continue;
+      const isNow=Math.abs(q.date-now)<1000;
+      ctx.fillStyle=isNow?"#fff":"rgba(255,255,255,.78)";
+      ctx.beginPath();ctx.arc(q.p.x,q.p.y,isNow?6:4,0,TAU);ctx.fill();
+      if(isNow){
+        ctx.font="700 12px -apple-system,BlinkMacSystemFont,sans-serif";
+        ctx.fillText("Сейчас",q.p.x+9,q.p.y-8);
+      }
+    }
+    ctx.restore();
+    return pts;
+  }
+
+  function draw(now){
+    ctx.clearRect(0,0,W,H);
+    if(!started || !locationData || !orientation) return;
+
+    const target=moonAltAz(now,locationData.lat,locationData.lon,locationData.alt);
+    const p=project(target.az,target.alt);
+
+    if(p){
+      const radius=Math.max(34,Math.min(78,W*.075));
+      drawMoonSprite(p.x,p.y,radius,target.illumination,target.phaseAngle);
+      drawFrame(p.x,p.y,radius);
+      drawInfo(p.x,p.y,target);
+    } else {
+      drawArrow(target);
+    }
+
+    drawTrajectory(now);
+    lastDraw=now.getTime();
+  }
+
+  function loop(ts){
+    if(started) draw(new Date());
+    requestAnimationFrame(loop);
+  }
+
+  canvas.addEventListener("click",e=>{
+    if(!trajectoryMode || !locationData || !orientation) return;
+    const now=new Date(), pts=trajectoryDates(trajectoryMode,now);
+    let best=null,bd=22;
+    for(const d of pts){
+      const t=moonAltAz(d,locationData.lat,locationData.lon,locationData.alt);
+      const p=project(t.az,t.alt); if(!p) continue;
+      const dist=Math.hypot(e.clientX-p.x,e.clientY-p.y);
+      if(dist<bd){bd=dist;best={date:d,t,p};}
+    }
+    if(best){
+      infoEl.innerHTML=`<b>${formatDateTime(best.date)}</b>${phaseName(best.t.illumination,best.t.phaseAngle)} · ${Math.round(best.t.illumination*100)}%`;
+      infoEl.style.left=best.p.x+"px"; infoEl.style.top=best.p.y+"px"; infoEl.style.display="block";
+      selectedPoint=best;
+    }else{
+      infoEl.style.display="none"; selectedPoint=null;
+    }
+  });
+
+  function setMode(mode){
+    trajectoryMode = trajectoryMode===mode ? null : mode;
+    btn12.classList.toggle("active",trajectoryMode==="12h");
+    btnCycle.classList.toggle("active",trajectoryMode==="cycle");
+    infoEl.style.display="none";
+  }
+  btn12.addEventListener("click",()=>setMode("12h"));
+  btnCycle.addEventListener("click",()=>setMode("cycle"));
+
+  document.addEventListener("visibilitychange",()=>{
+    if(document.visibilityState==="visible" && started) setStatus("AR активен");
+  });
+
+})();
+</script>
+</body>
+</html>
